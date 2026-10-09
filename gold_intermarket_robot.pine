@@ -1,0 +1,273 @@
+//@version=5
+// Ouro Intermarket Robot — compra/venda de ouro (XAUUSD) confirmada por prata (XAGUSD) e US Dollar Index (DXY).
+//
+// Lógica de um investidor privado (análise intermercados):
+//   - O ouro é cotado em dólares: dólar forte (DXY a subir) costuma pressionar o ouro -> relação INVERSA.
+//     Essa relação nem sempre se mantém, por isso só conta quando a correlação recente ouro/DXY é negativa.
+//   - A prata é o "irmão de beta alto" do ouro: quando a prata confirma (e lidera), o movimento é mais sólido.
+//   - Rácio Ouro/Prata a cair = apetite por metais (prata a superar o ouro) -> favorece compras; a subir -> defensivo.
+//
+// Score de confluência (-8 a +8), cada componente vale +1 (comprador), -1 (vendedor) ou 0:
+//   1. Tendência do ouro    : preço vs EMA 200 e EMA 21 vs EMA 50
+//   2. Momento do ouro      : RSI acima/abaixo de 50 e histograma do MACD
+//   3. Estrutura            : direção do Supertrend
+//   4. Tendência da prata   : prata vs a sua EMA 50
+//   5. Momento da prata     : ROC da prata
+//   6. Tendência do DXY     : DXY abaixo da EMA 50 = bom para o ouro (só se a correlação for negativa)
+//   7. Momento do DXY       : ROC do DXY negativo = bom para o ouro (só se a correlação for negativa)
+//   8. Rácio Ouro/Prata     : abaixo da sua EMA = metais fortes
+//
+// Entrada: score >= mínimo (ou <= -mínimo), ADX com tendência, filtro de timeframe superior, sessão Londres/NY,
+//          fora da janela do Payroll (1.ª sexta-feira do mês), sem posição e fora do período de espera.
+// Saída  : stop inicial em ATR, break-even, trailing stop "Chandelier" e alvo em múltiplos de R;
+//          fecha também se o score inverter.
+// Robot  : alertas JSON (alert()) prontos para webhook (PineConnector, MT5 bridge, 3Commas, bot próprio, etc.).
+strategy("Ouro Intermarket Robot (XAU + XAG + DXY)", shorttitle="Gold Robot", overlay=true,
+     pyramiding=0, initial_capital=10000, default_qty_type=strategy.fixed,
+     commission_type=strategy.commission.percent, commission_value=0.02, slippage=3,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+// ───── Inputs ─────
+grpMkt    = "Mercados"
+silverSym = input.symbol("OANDA:XAGUSD", "Prata", group=grpMkt)
+dxySym    = input.symbol("TVC:DXY", "US Dollar Index", group=grpMkt)
+
+grpTrend  = "Tendência e momento (ouro)"
+emaFastL  = input.int(21, "EMA rápida", minval=1, group=grpTrend)
+emaMidL   = input.int(50, "EMA média", minval=1, group=grpTrend)
+emaSlowL  = input.int(200, "EMA lenta", minval=1, group=grpTrend)
+rsiLen    = input.int(14, "RSI", minval=2, group=grpTrend)
+macdFast  = input.int(12, "MACD rápida", minval=1, group=grpTrend)
+macdSlow  = input.int(26, "MACD lenta", minval=1, group=grpTrend)
+macdSig   = input.int(9, "MACD sinal", minval=1, group=grpTrend)
+stFactor  = input.float(3.0, "Supertrend fator", minval=0.5, step=0.5, group=grpTrend)
+stLen     = input.int(10, "Supertrend ATR", minval=1, group=grpTrend)
+adxLen    = input.int(14, "ADX período", minval=2, group=grpTrend)
+adxMin    = input.float(20, "ADX mínimo (força da tendência)", minval=0, group=grpTrend)
+
+grpInter  = "Intermercados (prata / DXY)"
+interEmaL = input.int(50, "EMA da prata e do DXY", minval=1, group=grpInter)
+rocLen    = input.int(10, "ROC (momento) prata e DXY", minval=1, group=grpInter)
+corrLen   = input.int(50, "Janela da correlação", minval=10, group=grpInter)
+corrMax   = input.float(-0.2, "DXY só conta se correlação ouro/DXY <", minval=-1, maxval=1, step=0.05, group=grpInter)
+ratioLen  = input.int(50, "EMA do rácio Ouro/Prata", minval=1, group=grpInter)
+
+grpEntry  = "Entradas"
+minScore  = input.int(6, "Score mínimo para entrar (de 8)", minval=1, maxval=8, group=grpEntry)
+exitScore = input.int(-2, "Fechar se o score for contra (<= este valor no sentido da posição)", minval=-8, maxval=8, group=grpEntry)
+allowLng  = input.bool(true, "Permitir compras (long)", group=grpEntry)
+allowSht  = input.bool(true, "Permitir vendas (short)", group=grpEntry)
+useHtf    = input.bool(true, "Filtro de tendência no timeframe superior", group=grpEntry)
+htf       = input.timeframe("D", "Timeframe superior", group=grpEntry)
+htfEmaL   = input.int(50, "EMA do timeframe superior", minval=1, group=grpEntry)
+useSess   = input.bool(true, "Só operar na sessão Londres/NY (intradiário)", group=grpEntry)
+sess      = input.session("0700-1700", "Sessão (UTC)", group=grpEntry)
+useNfp    = input.bool(true, "Evitar Payroll (1.ª sexta, 12:00-14:00 UTC)", group=grpEntry)
+cooldown  = input.int(3, "Barras de espera após sair", minval=0, group=grpEntry)
+
+grpRisk   = "Risco"
+riskPct   = input.float(1.0, "Risco por trade (% do capital)", minval=0.1, step=0.1, group=grpRisk)
+atrLen    = input.int(14, "ATR período", minval=1, group=grpRisk)
+slMult    = input.float(1.5, "Stop inicial (x ATR)", minval=0.5, step=0.1, group=grpRisk)
+useTp     = input.bool(true, "Usar alvo (take profit)", group=grpRisk)
+tpR       = input.float(3.0, "Alvo (múltiplos de R)", minval=0.5, step=0.5, group=grpRisk)
+beR       = input.float(1.0, "Break-even a partir de (R)", minval=0.1, step=0.1, group=grpRisk)
+useTrail  = input.bool(true, "Trailing stop Chandelier (ativa após break-even)", group=grpRisk)
+trailMult = input.float(3.0, "Trailing (x ATR do extremo)", minval=0.5, step=0.5, group=grpRisk)
+qtyStep   = input.float(0.01, "Passo mínimo da quantidade", minval=0.000001, group=grpRisk)
+maxDayDD  = input.float(3.0, "Perda máxima diária (% do capital)", minval=0.5, step=0.5, group=grpRisk)
+
+grpVis    = "Visual"
+showTbl   = input.bool(true, "Mostrar painel", group=grpVis)
+showBg    = input.bool(true, "Colorir fundo pelo score", group=grpVis)
+
+strategy.risk.max_intraday_loss(maxDayDD, strategy.percent_of_equity)
+
+// ───── Dados intermercados (sem lookahead: sem repaint) ─────
+[agC, agEma, agRoc]   = request.security(silverSym, timeframe.period, [close, ta.ema(close, interEmaL), ta.roc(close, rocLen)], barmerge.gaps_off, barmerge.lookahead_off)
+[dxC, dxEma, dxRoc]   = request.security(dxySym, timeframe.period, [close, ta.ema(close, interEmaL), ta.roc(close, rocLen)], barmerge.gaps_off, barmerge.lookahead_off)
+// Timeframe superior: valor da barra anterior já fechada + lookahead_on = sem repaint
+htfBull = request.security(syminfo.tickerid, htf, close[1] > ta.ema(close, htfEmaL)[1], barmerge.gaps_off, barmerge.lookahead_on)
+htfBear = request.security(syminfo.tickerid, htf, close[1] < ta.ema(close, htfEmaL)[1], barmerge.gaps_off, barmerge.lookahead_on)
+
+// ───── Indicadores do ouro ─────
+emaFast = ta.ema(close, emaFastL)
+emaMid  = ta.ema(close, emaMidL)
+emaSlow = ta.ema(close, emaSlowL)
+rsi     = ta.rsi(close, rsiLen)
+[macdLine, sigLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+[stLine, stDir] = ta.supertrend(stFactor, stLen)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+atr     = ta.atr(atrLen)
+
+// Correlações sobre variações (retornos), mais fiáveis do que sobre preços
+corrDxy = ta.correlation(ta.change(close), ta.change(dxC), corrLen)
+corrAg  = ta.correlation(ta.change(close), ta.change(agC), corrLen)
+dxyOk   = corrDxy < corrMax
+
+gsr     = close / agC
+gsrEma  = ta.ema(gsr, ratioLen)
+
+// ───── Score de confluência ─────
+vote(bool bull, bool bear) => bull ? 1 : bear ? -1 : 0
+
+sTrend = vote(close > emaSlow and emaFast > emaMid, close < emaSlow and emaFast < emaMid)
+sMom   = vote(rsi > 50 and macdHist > 0, rsi < 50 and macdHist < 0)
+sStruc = vote(stDir < 0, stDir > 0)
+sAgTr  = vote(agC > agEma, agC < agEma)
+sAgMom = vote(agRoc > 0, agRoc < 0)
+sDxTr  = dxyOk ? vote(dxC < dxEma, dxC > dxEma) : 0
+sDxMom = dxyOk ? vote(dxRoc < 0, dxRoc > 0) : 0
+sGsr   = vote(gsr < gsrEma, gsr > gsrEma)
+score  = sTrend + sMom + sStruc + sAgTr + sAgMom + sDxTr + sDxMom + sGsr
+
+// ───── Filtros ─────
+inSess  = not useSess or timeframe.isdwm or not na(time(timeframe.period, sess, "UTC"))
+isNfp   = useNfp and dayofweek(time, "UTC") == dayofweek.friday and dayofmonth(time, "UTC") <= 7 and hour(time, "UTC") >= 12 and hour(time, "UTC") < 14
+trendOk = adx >= adxMin
+
+pos = strategy.position_size
+var int lastExitBar = na
+if nz(pos[1]) != 0 and pos == 0
+    lastExitBar := bar_index
+coolOk = na(lastExitBar) or bar_index - lastExitBar >= cooldown
+
+canTrade  = pos == 0 and inSess and not isNfp and trendOk and coolOk and not na(atr) and not na(agC) and not na(dxC)
+longSig   = canTrade and allowLng and score >= minScore and (not useHtf or htfBull)
+shortSig  = canTrade and allowSht and score <= -minScore and (not useHtf or htfBear)
+
+// ───── Gestão da posição ─────
+var float entryPx  = na   // preço médio de entrada
+var float riskDist = na   // 1R em preço
+var float extreme  = na   // máximo (compra) / mínimo (venda) desde a entrada
+var float curStop  = na
+var float curTp    = na
+var float pendRisk = na
+
+qtyFor(float dist) =>
+    q = (strategy.equity * riskPct / 100) / (dist * syminfo.pointvalue)
+    math.floor(q / qtyStep) * qtyStep
+
+// Posição acabou de abrir: fixa os níveis a partir do preço real de entrada
+if pos != 0 and nz(pos[1]) == 0
+    entryPx  := strategy.position_avg_price
+    riskDist := pendRisk
+    extreme  := pos > 0 ? high : low
+    curStop  := pos > 0 ? entryPx - riskDist : entryPx + riskDist
+    curTp    := useTp ? (pos > 0 ? entryPx + tpR * riskDist : entryPx - tpR * riskDist) : na
+
+if pos > 0
+    extreme := math.max(extreme, high)
+    if extreme >= entryPx + beR * riskDist
+        curStop := math.max(curStop, entryPx)
+        if useTrail
+            curStop := math.max(curStop, extreme - trailMult * atr)
+if pos < 0
+    extreme := math.min(extreme, low)
+    if extreme <= entryPx - beR * riskDist
+        curStop := math.min(curStop, entryPx)
+        if useTrail
+            curStop := math.min(curStop, extreme + trailMult * atr)
+if pos == 0
+    entryPx := na
+    riskDist := na
+    extreme := na
+    curStop := na
+    curTp := na
+
+// ───── Alertas JSON para o robot ─────
+f_json(string action, float qty, float sl, float tp) =>
+    '{"robot":"gold_intermarket","action":"' + action + '","symbol":"' + syminfo.ticker + '","price":' + str.tostring(close, format.mintick) +
+     ',"qty":' + str.tostring(qty) + ',"sl":' + (na(sl) ? 'null' : str.tostring(sl, format.mintick)) + ',"tp":' + (na(tp) ? 'null' : str.tostring(tp, format.mintick)) +
+     ',"score":' + str.tostring(score) + ',"tf":"' + timeframe.period + '"}'
+
+// ───── Ordens ─────
+if longSig
+    dist = slMult * atr
+    qty  = qtyFor(dist)
+    if qty > 0
+        pendRisk := dist
+        sl = close - dist
+        tp = useTp ? close + tpR * dist : na
+        strategy.entry("Compra", strategy.long, qty=qty, comment="Compra score " + str.tostring(score))
+        strategy.exit("Saída Compra", "Compra", stop=sl, limit=tp)
+        alert(f_json("buy", qty, sl, tp), alert.freq_once_per_bar_close)
+
+if shortSig
+    dist = slMult * atr
+    qty  = qtyFor(dist)
+    if qty > 0
+        pendRisk := dist
+        sl = close + dist
+        tp = useTp ? close - tpR * dist : na
+        strategy.entry("Venda", strategy.short, qty=qty, comment="Venda score " + str.tostring(score))
+        strategy.exit("Saída Venda", "Venda", stop=sl, limit=tp)
+        alert(f_json("sell", qty, sl, tp), alert.freq_once_per_bar_close)
+
+if pos > 0
+    strategy.exit("Saída Compra", "Compra", stop=curStop, limit=curTp)
+    if curStop != curStop[1] and not na(curStop[1])
+        alert(f_json("move_sl", pos, curStop, curTp), alert.freq_once_per_bar_close)
+    if score <= exitScore
+        strategy.close("Compra", comment="Score inverteu")
+        alert(f_json("close", pos, na, na), alert.freq_once_per_bar_close)
+
+if pos < 0
+    strategy.exit("Saída Venda", "Venda", stop=curStop, limit=curTp)
+    if curStop != curStop[1] and not na(curStop[1])
+        alert(f_json("move_sl", -pos, curStop, curTp), alert.freq_once_per_bar_close)
+    if score >= -exitScore
+        strategy.close("Venda", comment="Score inverteu")
+        alert(f_json("close", -pos, na, na), alert.freq_once_per_bar_close)
+
+// ───── Gráfico ─────
+plot(emaFast, "EMA rápida", color=color.new(color.aqua, 0))
+plot(emaMid, "EMA média", color=color.new(color.orange, 0))
+plot(emaSlow, "EMA lenta", color=color.new(color.white, 0), linewidth=2)
+plot(stDir < 0 ? stLine : na, "Supertrend alta", color=color.new(color.green, 30), style=plot.style_linebr)
+plot(stDir > 0 ? stLine : na, "Supertrend baixa", color=color.new(color.red, 30), style=plot.style_linebr)
+plot(curStop, "Stop", color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=2)
+plot(curTp, "Alvo", color=color.new(color.lime, 0), style=plot.style_linebr, linewidth=2)
+plot(entryPx, "Entrada", color=color.new(color.gray, 0), style=plot.style_linebr)
+
+plotshape(longSig, "Sinal compra", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small, text="BUY")
+plotshape(shortSig, "Sinal venda", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small, text="SELL")
+
+bgcolor(showBg ? (score >= minScore ? color.new(color.green, 88) : score <= -minScore ? color.new(color.red, 88) : na) : na)
+
+// ───── Painel ─────
+voteTxt(int v) => v > 0 ? "▲ comprador" : v < 0 ? "▼ vendedor" : "• neutro"
+voteCol(int v) => v > 0 ? color.lime : v < 0 ? color.red : color.gray
+
+var table tbl = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black, 20), border_width=1)
+if showTbl and barstate.islast
+    dir = pos > 0 ? "COMPRADO" : pos < 0 ? "VENDIDO" : "FORA"
+    scCol = score >= minScore ? color.lime : score <= -minScore ? color.red : color.yellow
+    table.cell(tbl, 0, 0, "Gold Robot", text_color=color.white)
+    table.cell(tbl, 1, 0, "Score " + str.tostring(score) + " / ±8", text_color=scCol)
+    table.cell(tbl, 0, 1, "Tendência ouro", text_color=color.white)
+    table.cell(tbl, 1, 1, voteTxt(sTrend), text_color=voteCol(sTrend))
+    table.cell(tbl, 0, 2, "Momento ouro", text_color=color.white)
+    table.cell(tbl, 1, 2, voteTxt(sMom), text_color=voteCol(sMom))
+    table.cell(tbl, 0, 3, "Supertrend", text_color=color.white)
+    table.cell(tbl, 1, 3, voteTxt(sStruc), text_color=voteCol(sStruc))
+    table.cell(tbl, 0, 4, "Prata tendência", text_color=color.white)
+    table.cell(tbl, 1, 4, voteTxt(sAgTr), text_color=voteCol(sAgTr))
+    table.cell(tbl, 0, 5, "Prata momento", text_color=color.white)
+    table.cell(tbl, 1, 5, voteTxt(sAgMom), text_color=voteCol(sAgMom))
+    table.cell(tbl, 0, 6, "DXY tendência", text_color=color.white)
+    table.cell(tbl, 1, 6, dxyOk ? voteTxt(sDxTr) : "ignorado (corr.)", text_color=voteCol(sDxTr))
+    table.cell(tbl, 0, 7, "DXY momento", text_color=color.white)
+    table.cell(tbl, 1, 7, dxyOk ? voteTxt(sDxMom) : "ignorado (corr.)", text_color=voteCol(sDxMom))
+    table.cell(tbl, 0, 8, "Rácio Ouro/Prata", text_color=color.white)
+    table.cell(tbl, 1, 8, str.tostring(gsr, "#.0") + "  " + voteTxt(sGsr), text_color=voteCol(sGsr))
+    table.cell(tbl, 0, 9, "Corr. ouro/DXY | ouro/prata", text_color=color.white)
+    table.cell(tbl, 1, 9, str.tostring(corrDxy, "#.00") + " | " + str.tostring(corrAg, "#.00"), text_color=color.white)
+    table.cell(tbl, 0, 10, "ADX | ATR", text_color=color.white)
+    table.cell(tbl, 1, 10, str.tostring(adx, "#.0") + " | " + str.tostring(atr, format.mintick), text_color=trendOk ? color.white : color.gray)
+    table.cell(tbl, 0, 11, "Filtros", text_color=color.white)
+    table.cell(tbl, 1, 11, (inSess ? "sessão ok" : "fora sessão") + (isNfp ? " · Payroll" : "") + (useHtf ? (htfBull ? " · HTF ▲" : htfBear ? " · HTF ▼" : " · HTF -") : ""), text_color=color.white)
+    table.cell(tbl, 0, 12, "Posição", text_color=color.white)
+    table.cell(tbl, 1, 12, dir, text_color=pos > 0 ? color.lime : pos < 0 ? color.red : color.gray)
+    table.cell(tbl, 0, 13, "Stop | Alvo", text_color=color.white)
+    table.cell(tbl, 1, 13, pos != 0 ? str.tostring(curStop, format.mintick) + " | " + (na(curTp) ? "trailing" : str.tostring(curTp, format.mintick)) : "-", text_color=color.white)

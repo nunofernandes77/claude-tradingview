@@ -1,0 +1,108 @@
+//@version=5
+// Painel Intermercados do Ouro — sub-gráfico para usar por baixo do "Ouro Intermarket Robot".
+//
+// Mostra no mesmo painel, normalizados (z-score), o ouro, a prata e o DXY INVERTIDO,
+// para se ver de imediato se os três "concordam". Quando as três linhas sobem juntas o ouro tem
+// vento a favor; quando o ouro sobe sozinho (prata fraca, dólar forte) o movimento é suspeito (divergência).
+// Inclui ainda as correlações móveis e um histograma com o score de confluência do robot (-8 a +8).
+// Mantenha os parâmetros iguais aos da estratégia para o score coincidir.
+indicator("Painel Intermercados do Ouro (XAU / XAG / DXY)", shorttitle="Gold Intermarket", overlay=false)
+
+// ───── Inputs ─────
+grpMkt    = "Mercados"
+silverSym = input.symbol("OANDA:XAGUSD", "Prata", group=grpMkt)
+dxySym    = input.symbol("TVC:DXY", "US Dollar Index", group=grpMkt)
+
+grpView   = "Visualização"
+mode      = input.string("Preços normalizados", "Mostrar", options=["Preços normalizados", "Score de confluência", "Correlações"], group=grpView)
+zLen      = input.int(100, "Janela do z-score", minval=10, group=grpView)
+divLen    = input.int(20, "Janela para divergências", minval=5, group=grpView)
+
+grpScore  = "Score (igual à estratégia)"
+emaFastL  = input.int(21, "EMA rápida", minval=1, group=grpScore)
+emaMidL   = input.int(50, "EMA média", minval=1, group=grpScore)
+emaSlowL  = input.int(200, "EMA lenta", minval=1, group=grpScore)
+rsiLen    = input.int(14, "RSI", minval=2, group=grpScore)
+stFactor  = input.float(3.0, "Supertrend fator", minval=0.5, step=0.5, group=grpScore)
+stLen     = input.int(10, "Supertrend ATR", minval=1, group=grpScore)
+interEmaL = input.int(50, "EMA da prata e do DXY", minval=1, group=grpScore)
+rocLen    = input.int(10, "ROC prata e DXY", minval=1, group=grpScore)
+corrLen   = input.int(50, "Janela da correlação", minval=10, group=grpScore)
+corrMax   = input.float(-0.2, "DXY só conta se correlação ouro/DXY <", minval=-1, maxval=1, step=0.05, group=grpScore)
+ratioLen  = input.int(50, "EMA do rácio Ouro/Prata", minval=1, group=grpScore)
+minScore  = input.int(6, "Score mínimo para entrar", minval=1, maxval=8, group=grpScore)
+
+// ───── Dados ─────
+[agC, agEma, agRoc] = request.security(silverSym, timeframe.period, [close, ta.ema(close, interEmaL), ta.roc(close, rocLen)], barmerge.gaps_off, barmerge.lookahead_off)
+[dxC, dxEma, dxRoc] = request.security(dxySym, timeframe.period, [close, ta.ema(close, interEmaL), ta.roc(close, rocLen)], barmerge.gaps_off, barmerge.lookahead_off)
+
+zscore(float src, int len) =>
+    sd = ta.stdev(src, len)
+    sd == 0 ? 0.0 : (src - ta.sma(src, len)) / sd
+
+zGold = zscore(close, zLen)
+zAg   = zscore(agC, zLen)
+zDxyI = -zscore(dxC, zLen)   // DXY invertido: a subir = dólar a enfraquecer = bom para o ouro
+
+corrDxy = ta.correlation(ta.change(close), ta.change(dxC), corrLen)
+corrAg  = ta.correlation(ta.change(close), ta.change(agC), corrLen)
+dxyOk   = corrDxy < corrMax
+
+// ───── Score (mesma lógica da estratégia) ─────
+emaFast = ta.ema(close, emaFastL)
+emaMid  = ta.ema(close, emaMidL)
+emaSlow = ta.ema(close, emaSlowL)
+rsi     = ta.rsi(close, rsiLen)
+[macdLine, sigLine, macdHist] = ta.macd(close, 12, 26, 9)
+[stLine, stDir] = ta.supertrend(stFactor, stLen)
+gsr     = close / agC
+gsrEma  = ta.ema(gsr, ratioLen)
+
+vote(bool bull, bool bear) => bull ? 1 : bear ? -1 : 0
+
+score = vote(close > emaSlow and emaFast > emaMid, close < emaSlow and emaFast < emaMid) +
+     vote(rsi > 50 and macdHist > 0, rsi < 50 and macdHist < 0) +
+     vote(stDir < 0, stDir > 0) +
+     vote(agC > agEma, agC < agEma) +
+     vote(agRoc > 0, agRoc < 0) +
+     (dxyOk ? vote(dxC < dxEma, dxC > dxEma) : 0) +
+     (dxyOk ? vote(dxRoc < 0, dxRoc > 0) : 0) +
+     vote(gsr < gsrEma, gsr > gsrEma)
+
+// ───── Divergências: ouro faz novo máximo/mínimo mas a prata não confirma ─────
+goldHH = close >= ta.highest(close, divLen)
+agHH   = agC >= ta.highest(agC, divLen)
+goldLL = close <= ta.lowest(close, divLen)
+agLL   = agC <= ta.lowest(agC, divLen)
+bearDiv = goldHH and not agHH and zDxyI < zDxyI[divLen]   // máximo do ouro sem prata e com dólar a fortalecer
+bullDiv = goldLL and not agLL and zDxyI > zDxyI[divLen]   // mínimo do ouro sem prata e com dólar a enfraquecer
+
+// ───── Gráfico ─────
+showPx = mode == "Preços normalizados"
+showSc = mode == "Score de confluência"
+showCo = mode == "Correlações"
+
+plot(showPx ? zGold : na, "Ouro (z)", color=color.new(color.yellow, 0), linewidth=2)
+plot(showPx ? zAg : na, "Prata (z)", color=color.new(color.silver, 0))
+plot(showPx ? zDxyI : na, "DXY invertido (z)", color=color.new(color.aqua, 0))
+
+scCol = score >= minScore ? color.lime : score > 0 ? color.new(color.green, 50) : score <= -minScore ? color.red : score < 0 ? color.new(color.red, 50) : color.gray
+plot(showSc ? score : na, "Score", color=scCol, style=plot.style_columns)
+plot(showSc ? minScore : na, "Limiar compra", color=color.new(color.lime, 50), style=plot.style_linebr)
+plot(showSc ? -minScore : na, "Limiar venda", color=color.new(color.red, 50), style=plot.style_linebr)
+
+plot(showCo ? corrDxy : na, "Correlação ouro/DXY", color=color.new(color.aqua, 0), linewidth=2)
+plot(showCo ? corrAg : na, "Correlação ouro/prata", color=color.new(color.silver, 0), linewidth=2)
+plot(showCo ? corrMax : na, "Limiar DXY", color=color.new(color.orange, 40), style=plot.style_linebr)
+
+hline(0, "Zero", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+
+plotshape(bearDiv, "Divergência baixista", shape.xcross, location.top, color.new(color.red, 0), size=size.tiny)
+plotshape(bullDiv, "Divergência altista", shape.xcross, location.bottom, color.new(color.lime, 0), size=size.tiny)
+
+bgcolor(showPx and zGold > 0 and zAg > 0 and zDxyI > 0 ? color.new(color.green, 90) : showPx and zGold < 0 and zAg < 0 and zDxyI < 0 ? color.new(color.red, 90) : na)
+
+alertcondition(bearDiv, "Divergência baixista no ouro", "Ouro fez máximo sem confirmação da prata e com dólar a fortalecer")
+alertcondition(bullDiv, "Divergência altista no ouro", "Ouro fez mínimo sem confirmação da prata e com dólar a enfraquecer")
+alertcondition(ta.crossover(score, minScore - 1), "Score comprador", "Score de confluência do ouro atingiu o limiar de compra")
+alertcondition(ta.crossunder(score, -minScore + 1), "Score vendedor", "Score de confluência do ouro atingiu o limiar de venda")

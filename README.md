@@ -19,3 +19,59 @@ Os resultados aparecem no separador *Strategy Tester*.
 
 Funciona melhor em timeframe diário e em mercados com tendência (futuros, índices, forex, cripto).
 Não é recomendação de investimento; faça backtest e use conta demo antes de arriscar dinheiro real.
+
+## Ouro Intermarket Robot — `gold_intermarket_robot.pine` + `gold_intermarket_panel.pine`
+
+Estratégia (robot) de compra e venda de **ouro (XAUUSD)** que confirma cada sinal com a **prata (XAGUSD)**
+e o **US Dollar Index (DXY)**, mais um painel em sub-janela para ver os três mercados ao mesmo tempo.
+
+**Como pôr no gráfico:** abrir `OANDA:XAUUSD` (ou `TVC:GOLD`, `COMEX:GC1!`) → *Pine Editor* → colar
+`gold_intermarket_robot.pine` → *Add to chart*. Repetir com `gold_intermarket_panel.pine` (abre por baixo).
+Timeframes sugeridos: 1H / 4H (intradiário) ou 1D (swing).
+
+### Score de confluência (-8 a +8)
+
+| # | Componente | Comprador (+1) | Vendedor (-1) |
+|---|---|---|---|
+| 1 | Tendência do ouro | preço > EMA200 e EMA21 > EMA50 | preço < EMA200 e EMA21 < EMA50 |
+| 2 | Momento do ouro | RSI > 50 e MACD hist. > 0 | RSI < 50 e MACD hist. < 0 |
+| 3 | Estrutura | Supertrend em alta | Supertrend em baixa |
+| 4 | Tendência da prata | prata > EMA50 | prata < EMA50 |
+| 5 | Momento da prata | ROC(10) > 0 | ROC(10) < 0 |
+| 6 | Tendência do DXY* | DXY < EMA50 (dólar fraco) | DXY > EMA50 |
+| 7 | Momento do DXY* | ROC(10) < 0 | ROC(10) > 0 |
+| 8 | Rácio Ouro/Prata | abaixo da EMA50 (metais fortes) | acima da EMA50 |
+
+\* O DXY só vota quando a correlação móvel (50 barras, sobre retornos) entre ouro e dólar é negativa (< -0,2);
+quando a relação inversa se quebra, o dólar é ignorado.
+
+### Regras do robot
+
+- **Entrada**: score ≥ 6 (compra) ou ≤ -6 (venda), ADX ≥ 20, tendência a favor no timeframe superior (EMA50 diária),
+  sessão Londres/NY (07:00–17:00 UTC), fora da janela do Payroll e 3 barras de espera após cada saída.
+- **Risco**: 1% do capital por trade; stop inicial 1,5×ATR; alvo 3R; break-even a 1R; depois trailing
+  Chandelier 3×ATR; fecha também se o score inverter (≤ -2 numa compra); perda máxima diária de 3%.
+- **Sem repaint**: os dados da prata/DXY usam `lookahead_off` e o timeframe superior usa a barra anterior já fechada;
+  os sinais são calculados no fecho da barra.
+
+### Automação (webhook)
+
+Criar um alerta na estratégia com a condição **"alert() function calls only"** e ativar *Webhook URL*.
+O robot envia JSON como:
+
+```json
+{"robot":"gold_intermarket","action":"buy","symbol":"XAUUSD","price":2650.15,"qty":0.66,"sl":2635.10,"tp":2695.30,"score":7,"tf":"60"}
+```
+
+`action` pode ser `buy`, `sell`, `move_sl` (novo stop do break-even/trailing) ou `close` (score inverteu).
+O servidor/bridge (PineConnector, ponte para MT5, bot próprio) deve abrir a ordem já com SL/TP e atualizar o stop a cada `move_sl`.
+
+### Painel intermercados
+
+- **Preços normalizados**: z-score do ouro, prata e DXY invertido — três linhas juntas a subir = vento a favor do ouro.
+- **Score de confluência**: histograma com os limiares de compra/venda.
+- **Correlações**: ouro/DXY e ouro/prata móveis.
+- Marca **divergências** (ouro faz máximo/mínimo sem confirmação da prata e com o dólar contra) e tem `alertcondition`s.
+
+Ajuste os parâmetros e valide no *Strategy Tester* (e em conta demo) antes de ligar o robot a uma conta real.
+Não é recomendação de investimento.
