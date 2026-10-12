@@ -75,3 +75,28 @@ O servidor/bridge (PineConnector, ponte para MT5, bot próprio) deve abrir a ord
 
 Ajuste os parâmetros e valide no *Strategy Tester* (e em conta demo) antes de ligar o robot a uma conta real.
 Não é recomendação de investimento.
+
+## Pin Bar Scanner — `pin_bar_scanner.pine`
+
+Procura **pin bars** em tempo real em **40 gráficos ao mesmo tempo** (28 pares forex + ouro, prata, platina,
+paládio, cobre, WTI, Brent, gás natural, milho, trigo, soja e açúcar) e envia **um alerta por e-mail e
+notificação na app** a dizer em que gráfico apareceu, **assim que a vela de 15 minutos fecha**.
+
+**Instalar (uma vez):**
+1. Abrir `OANDA:EURUSD` em **15 minutos** → *Pine Editor* → colar `pin_bar_scanner.pine` → *Add to chart*.
+2. Criar alerta (relógio ⏰): **Condição** = *PinBar Scanner* → *Any alert() function call*;
+   **Expiração** = sem expiração; **Notificações** = ✅ *Notificar na app* + ✅ *Enviar e-mail*.
+3. Pode fechar o TradingView: o alerta corre nos servidores e cobre os 40 gráficos.
+
+Exemplo da mensagem recebida:
+
+```
+PIN BAR 15m — vela fechada às 14:15
+▲ XAUUSD — PIN BAR ALTISTA (compra) 4155.2 | pavio 74%
+▼ GBPJPY — PIN BAR BAIXISTA (venda) 198.412 | pavio 66%
+```
+
+**Regras (ajustáveis):** pavio ≥ 60% da vela, corpo ≤ 33%, pavio oposto ≤ 20%, vela ≥ 1×ATR(14)
+e o pavio tem de fazer o mínimo (altista) ou máximo (baixista) das últimas 5 velas, como uma rejeição de nível.
+Os símbolos podem ser trocados nas definições do indicador. O gráfico aberto também mostra as suas pin bars
+e um painel com as pin bars recentes de todos os gráficos.

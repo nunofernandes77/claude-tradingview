@@ -1,0 +1,150 @@
+//@version=5
+// Pin Bar Scanner — procura pin bars em 40 gráficos ao mesmo tempo (28 pares forex + 12 matérias-primas)
+// e envia UM alerta (e-mail + notificação na app) a dizer em que gráfico apareceu, assim que a vela fecha.
+//
+// Como usar:
+//   1. Abrir um gráfico OANDA:EURUSD em 15 minutos (o timeframe do gráfico é o timeframe que é procurado).
+//   2. Adicionar este indicador.
+//   3. Criar alerta: Condição = "Pin Bar Scanner" -> "Qualquer chamada da função alert()"
+//      (Any alert() function call); Expiração = sem expiração; Notificações = "Notificar na app" + "Enviar e-mail".
+//   Um só alerta cobre os 40 gráficos. A mensagem diz o símbolo, o sentido, o preço e o tamanho do pavio.
+//
+// Pin bar (vela de rejeição, como na fotografia):
+//   Altista (compra) : pavio inferior longo (>= 60% da vela), corpo pequeno (<= 33%) na parte de cima,
+//                      pavio superior curto (<= 20%), e o pavio faz o mínimo das últimas N velas.
+//   Baixista (venda) : o espelho — pavio superior longo, corpo pequeno em baixo, faz o máximo das últimas N velas.
+//   A vela tem de ter pelo menos 1x ATR(14) de tamanho, para ignorar velas minúsculas sem significado.
+indicator("Pin Bar Scanner — Forex e Matérias-primas", shorttitle="PinBar Scanner", overlay=true)
+
+// ───── Regras da pin bar ─────
+grpPin   = "Regras da pin bar"
+wickMin  = input.float(60, "Pavio (nariz) mínimo, % da vela", minval=40, maxval=95, group=grpPin)
+bodyMax  = input.float(33, "Corpo máximo, % da vela", minval=5, maxval=50, group=grpPin)
+oppMax   = input.float(20, "Pavio oposto máximo, % da vela", minval=0, maxval=40, group=grpPin)
+atrMult  = input.float(1.0, "Tamanho mínimo da vela (x ATR 14)", minval=0, step=0.1, group=grpPin)
+lookback = input.int(5, "O pavio faz o mínimo/máximo das últimas N velas (0 = desligado)", minval=0, group=grpPin)
+colorFav = input.bool(false, "Exigir cor a favor (verde na altista, vermelha na baixista)", group=grpPin)
+
+grpVis   = "Painel"
+tz       = input.string("Europe/Lisbon", "Fuso horário", group=grpVis)
+recent   = input.int(8, "Mostrar pin bars das últimas N velas", minval=1, group=grpVis)
+showTbl  = input.bool(true, "Mostrar painel", group=grpVis)
+
+// ───── Símbolos (pode trocar qualquer um nas definições) ─────
+grpFx = "Forex (28 pares)"
+s01 = input.symbol("OANDA:EURUSD", "", inline="f1", group=grpFx)
+s02 = input.symbol("OANDA:GBPUSD", "", inline="f1", group=grpFx)
+s03 = input.symbol("OANDA:USDJPY", "", inline="f2", group=grpFx)
+s04 = input.symbol("OANDA:USDCHF", "", inline="f2", group=grpFx)
+s05 = input.symbol("OANDA:USDCAD", "", inline="f3", group=grpFx)
+s06 = input.symbol("OANDA:AUDUSD", "", inline="f3", group=grpFx)
+s07 = input.symbol("OANDA:NZDUSD", "", inline="f4", group=grpFx)
+s08 = input.symbol("OANDA:EURGBP", "", inline="f4", group=grpFx)
+s09 = input.symbol("OANDA:EURJPY", "", inline="f5", group=grpFx)
+s10 = input.symbol("OANDA:EURCHF", "", inline="f5", group=grpFx)
+s11 = input.symbol("OANDA:EURCAD", "", inline="f6", group=grpFx)
+s12 = input.symbol("OANDA:EURAUD", "", inline="f6", group=grpFx)
+s13 = input.symbol("OANDA:EURNZD", "", inline="f7", group=grpFx)
+s14 = input.symbol("OANDA:GBPJPY", "", inline="f7", group=grpFx)
+s15 = input.symbol("OANDA:GBPCHF", "", inline="f8", group=grpFx)
+s16 = input.symbol("OANDA:GBPCAD", "", inline="f8", group=grpFx)
+s17 = input.symbol("OANDA:GBPAUD", "", inline="f9", group=grpFx)
+s18 = input.symbol("OANDA:GBPNZD", "", inline="f9", group=grpFx)
+s19 = input.symbol("OANDA:AUDJPY", "", inline="f10", group=grpFx)
+s20 = input.symbol("OANDA:AUDCHF", "", inline="f10", group=grpFx)
+s21 = input.symbol("OANDA:AUDCAD", "", inline="f11", group=grpFx)
+s22 = input.symbol("OANDA:AUDNZD", "", inline="f11", group=grpFx)
+s23 = input.symbol("OANDA:NZDJPY", "", inline="f12", group=grpFx)
+s24 = input.symbol("OANDA:NZDCHF", "", inline="f12", group=grpFx)
+s25 = input.symbol("OANDA:NZDCAD", "", inline="f13", group=grpFx)
+s26 = input.symbol("OANDA:CADJPY", "", inline="f13", group=grpFx)
+s27 = input.symbol("OANDA:CADCHF", "", inline="f14", group=grpFx)
+s28 = input.symbol("OANDA:CHFJPY", "", inline="f14", group=grpFx)
+
+grpCm = "Matérias-primas (12)"
+s29 = input.symbol("OANDA:XAUUSD", "", inline="c1", group=grpCm)
+s30 = input.symbol("OANDA:XAGUSD", "", inline="c1", group=grpCm)
+s31 = input.symbol("OANDA:XPTUSD", "", inline="c2", group=grpCm)
+s32 = input.symbol("OANDA:XPDUSD", "", inline="c2", group=grpCm)
+s33 = input.symbol("OANDA:XCUUSD", "", inline="c3", group=grpCm)
+s34 = input.symbol("OANDA:WTICOUSD", "", inline="c3", group=grpCm)
+s35 = input.symbol("OANDA:BCOUSD", "", inline="c4", group=grpCm)
+s36 = input.symbol("OANDA:NATGASUSD", "", inline="c4", group=grpCm)
+s37 = input.symbol("OANDA:CORNUSD", "", inline="c5", group=grpCm)
+s38 = input.symbol("OANDA:WHEATUSD", "", inline="c5", group=grpCm)
+s39 = input.symbol("OANDA:SOYBNUSD", "", inline="c6", group=grpCm)
+s40 = input.symbol("OANDA:SUGARUSD", "", inline="c6", group=grpCm)
+
+// ───── Deteção (corre dentro de cada símbolo) ─────
+pinBar() =>
+    rng    = high - low
+    body   = math.abs(close - open)
+    upW    = high - math.max(open, close)
+    loW    = math.min(open, close) - low
+    atr    = ta.atr(14)
+    prevLo = ta.lowest(low, math.max(lookback, 1))[1]
+    prevHi = ta.highest(high, math.max(lookback, 1))[1]
+    bigOk  = rng > 0 and rng >= atrMult * atr
+    shape  = body <= bodyMax / 100 * rng
+    bull   = bigOk and shape and loW >= wickMin / 100 * rng and upW <= oppMax / 100 * rng and (lookback == 0 or low <= prevLo) and (not colorFav or close >= open)
+    bear   = bigOk and shape and upW >= wickMin / 100 * rng and loW <= oppMax / 100 * rng and (lookback == 0 or high >= prevHi) and (not colorFav or close <= open)
+    dir    = bull ? 1 : bear ? -1 : 0
+    pct    = rng > 0 ? (bear ? upW : loW) / rng * 100 : 0.0
+    [dir, time, close, pct]
+
+// Memória da última pin bar de cada símbolo (para o painel)
+var lastDir  = array.new_int(40, 0)
+var lastTime = array.new_int(40, 0)
+var lastPx   = array.new_float(40, na)
+var names    = array.new_string(40, "")
+
+// Pede os dados de um símbolo; devolve uma linha de mensagem se a vela que acabou de fechar for pin bar.
+// O t == time garante que é a mesma vela de 15 min do gráfico (ignora mercados fechados / dados parados).
+scan(int idx, simple string sym) =>
+    [d, t, c, p] = request.security(sym, timeframe.period, pinBar(), barmerge.gaps_off, barmerge.lookahead_off)
+    parts = str.split(sym, ":")
+    name  = array.get(parts, array.size(parts) - 1)
+    array.set(names, idx, name)
+    hit = d != 0 and t == time
+    if hit
+        array.set(lastDir, idx, d)
+        array.set(lastTime, idx, t)
+        array.set(lastPx, idx, c)
+    hit ? (d > 0 ? "▲ " + name + " — PIN BAR ALTISTA (compra) " : "▼ " + name + " — PIN BAR BAIXISTA (venda) ") + str.tostring(c) + " | pavio " + str.tostring(p, "#") + "%\n" : ""
+
+msg = scan(0, s01) + scan(1, s02) + scan(2, s03) + scan(3, s04) + scan(4, s05) + scan(5, s06) + scan(6, s07) + scan(7, s08) +
+     scan(8, s09) + scan(9, s10) + scan(10, s11) + scan(11, s12) + scan(12, s13) + scan(13, s14) + scan(14, s15) + scan(15, s16) +
+     scan(16, s17) + scan(17, s18) + scan(18, s19) + scan(19, s20) + scan(20, s21) + scan(21, s22) + scan(22, s23) + scan(23, s24) +
+     scan(24, s25) + scan(25, s26) + scan(26, s27) + scan(27, s28) + scan(28, s29) + scan(29, s30) + scan(30, s31) + scan(31, s32) +
+     scan(32, s33) + scan(33, s34) + scan(34, s35) + scan(35, s36) + scan(36, s37) + scan(37, s38) + scan(38, s39) + scan(39, s40)
+
+// ───── Alerta: um só envio por vela fechada, com todos os gráficos que deram pin bar ─────
+if str.length(msg) > 0
+    alert("PIN BAR " + timeframe.period + "m — vela fechada às " + str.format_time(time_close, "HH:mm", tz) + "\n" + msg, alert.freq_once_per_bar_close)
+
+// ───── Pin bars no próprio gráfico aberto ─────
+[cDir, cTime, cClose, cPct] = pinBar()
+plotshape(cDir > 0, "Pin bar altista", shape.triangleup, location.belowbar, color.new(color.lime, 0), size=size.small, text="PIN")
+plotshape(cDir < 0, "Pin bar baixista", shape.triangledown, location.abovebar, color.new(color.red, 0), size=size.small, text="PIN")
+
+// ───── Painel: pin bars recentes em todos os gráficos ─────
+var table tbl = table.new(position.top_right, 3, 41, bgcolor=color.new(color.black, 20), border_width=1)
+if showTbl and barstate.islast
+    table.clear(tbl, 0, 0, 2, 40)
+    table.cell(tbl, 0, 0, "Pin bars " + timeframe.period + "m", text_color=color.white)
+    table.cell(tbl, 1, 0, "Sentido", text_color=color.white)
+    table.cell(tbl, 2, 0, "Hora", text_color=color.white)
+    maxAge = recent * timeframe.in_seconds() * 1000
+    row = 1
+    for i = 0 to 39
+        lt = array.get(lastTime, i)
+        if lt > 0 and time - lt < maxAge
+            ld = array.get(lastDir, i)
+            table.cell(tbl, 0, row, array.get(names, i), text_color=color.white)
+            table.cell(tbl, 1, row, ld > 0 ? "▲ compra" : "▼ venda", text_color=ld > 0 ? color.lime : color.red)
+            table.cell(tbl, 2, row, str.format_time(lt, "dd/MM HH:mm", tz), text_color=color.white)
+            row += 1
+    if row == 1
+        table.cell(tbl, 0, 1, "nenhuma nas últimas " + str.tostring(recent) + " velas", text_color=color.gray)
+    if timeframe.period != "15"
+        table.cell(tbl, 0, math.min(row + (row == 1 ? 1 : 0), 40), "Atenção: gráfico não está em 15m", text_color=color.orange)
